@@ -1,0 +1,129 @@
+services:
+
+  postgres:
+    image: postgres:17
+    container_name: aksara-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    networks:
+      - aksara-backend
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: aksara-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD}
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - aksara-backend
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "redis-cli",
+          "-a",
+          "${REDIS_PASSWORD}",
+          "ping"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./backend
+    container_name: aksara-api
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      SECRET_KEY: ${AKSARA_SECRET_KEY}
+      APP_VERSION: ${AKSARA_VERSION}
+      AGENT_INGEST_KEY: ${AKSARA_AGENT_INGEST_KEY}
+
+      GUACD_HOST: guacd
+      GUACD_PORT: 4822
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    ports:
+      - "8000:8000"
+
+    networks:
+      - aksara-backend
+
+  monitor:
+    build:
+      context: ./backend
+    container_name: aksara-monitor
+    restart: unless-stopped
+
+    command:
+      - python
+      - -m
+      - app.monitor_worker
+
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      SECRET_KEY: ${AKSARA_SECRET_KEY}
+      APP_VERSION: ${AKSARA_VERSION}
+      AGENT_INGEST_KEY: ${AKSARA_AGENT_INGEST_KEY}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    networks:
+      - aksara-backend
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: aksara-frontend
+    restart: unless-stopped
+
+    depends_on:
+      - api
+
+    ports:
+      - "5173:5173"
+
+    networks:
+      - aksara-backend
+
+  guacd:
+    image: guacamole/guacd:latest
+    container_name: aksara-guacd
+    restart: unless-stopped
+    networks:
+      - aksara-backend
+    volumes:
+      - /opt/aksara/data/guacd-drive:/drive
+networks:
+  aksara-backend:
+    name: aksara-backend

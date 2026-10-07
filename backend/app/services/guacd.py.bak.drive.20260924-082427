@@ -1,0 +1,408 @@
+import asyncio
+
+from app.core.config import settings
+
+
+class GuacdError(Exception):
+    pass
+
+
+def encode_instruction(*elements: str) -> bytes:
+    """
+    Encode one Guacamole protocol instruction.
+
+    Example:
+        select, rdp
+
+    becomes length-prefixed Guacamole protocol data.
+    """
+
+    encoded = []
+
+    for element in elements:
+        value = str(element)
+        encoded.append(
+            f"{len(value.encode('utf-8'))}.{value}"
+        )
+
+    return (
+        ",".join(encoded) + ";"
+    ).encode("utf-8")
+
+
+async def read_instruction(
+    reader: asyncio.StreamReader,
+) -> list[str]:
+    """
+    Read one complete Guacamole instruction.
+    """
+
+    elements = []
+
+    while True:
+        length_raw = bytearray()
+
+        while True:
+            char = await reader.readexactly(1)
+
+            if char == b".":
+                break
+
+            if not char.isdigit():
+                raise GuacdError(
+                    "Invalid Guacamole instruction length"
+                )
+
+            length_raw.extend(char)
+
+        if not length_raw:
+            raise GuacdError(
+                "Empty Guacamole instruction length"
+            )
+
+        length = int(
+            length_raw.decode("ascii")
+        )
+
+        value = await reader.readexactly(
+            length
+        )
+
+        separator = await reader.readexactly(
+            1
+        )
+
+        elements.append(
+            value.decode(
+                "utf-8",
+                errors="replace",
+            )
+        )
+
+        if separator == b";":
+            return elements
+
+        if separator != b",":
+            raise GuacdError(
+                "Invalid Guacamole instruction separator"
+            )
+
+
+async def send_instruction(
+    writer: asyncio.StreamWriter,
+    *elements: str,
+) -> None:
+
+    writer.write(
+        encode_instruction(*elements)
+    )
+
+    await writer.drain()
+
+
+async def open_guacd():
+    """
+    Open connection to configured guacd service.
+    """
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.open_connection(
+                settings.GUACD_HOST,
+                settings.GUACD_PORT,
+            ),
+            timeout=5,
+        )
+
+    except Exception as exc:
+        raise GuacdError(
+            f"Unable to connect to guacd: {exc}"
+        ) from exc
+
+
+async def probe_rdp():
+    """
+    Perform the first Guacamole handshake step.
+
+    Expected response:
+        args,...
+    """
+
+    reader, writer = await open_guacd()
+
+    try:
+        await send_instruction(
+            writer,
+            "select",
+            "rdp",
+        )
+
+        response = await asyncio.wait_for(
+            read_instruction(reader),
+            timeout=5,
+        )
+
+        if (
+            not response
+            or response[0] != "args"
+        ):
+            raise GuacdError(
+                "Unexpected guacd response: "
+                f"{response}"
+            )
+
+        return response
+
+    finally:
+        writer.close()
+
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+def build_rdp_connect_values(
+    argument_names: list[str],
+    *,
+    hostname: str,
+    port: int,
+    username: str,
+    password: str,
+    domain: str = "",
+    width: int = 1280,
+    height: int = 720,
+    dpi: int = 96,
+) -> list[str]:
+    """
+    Build RDP connection values in exactly the order
+    advertised by guacd through the args instruction.
+    """
+
+    values = {
+        "hostname": hostname,
+        "port": str(port),
+        "domain": domain,
+        "username": username,
+        "password": password,
+
+        "width": str(width),
+        "height": str(height),
+        "dpi": str(dpi),
+
+        # Allow an active RDP session to change its
+        # remote desktop resolution when the browser
+        # sends a Guacamole "size" instruction.
+        #
+        # RDP 8.1+ supports the Display Update channel.
+        "resize-method": "display-update",
+
+        "color-depth": "32",
+
+        # Common Windows environments often use
+        # self-signed RDP certificates.
+        "ignore-cert": "true",
+
+        # Let FreeRDP/guacd negotiate the appropriate
+        # security mechanism.
+        "security": "any",
+
+        # Performance-friendly defaults for browser RDP.
+        "enable-wallpaper": "true",
+        "enable-theming": "true",
+        "enable-font-smoothing": "true",
+        "enable-full-window-drag": "true",
+        "enable-desktop-composition": "true",
+        "enable-menu-animations": "true",
+
+        # Clipboard remains enabled.
+        "disable-copy": "false",
+        "disable-paste": "false",
+
+        # Not read-only.
+        "read-only": "false",
+
+        # Identify the RDP client.
+        "client-name": "AKSARA",
+    }
+
+    return [
+        values.get(
+            argument,
+            "",
+        )
+        for argument in argument_names
+    ]
+
+
+async def connect_rdp(
+    *,
+    hostname: str,
+    port: int,
+    username: str,
+    password: str,
+    domain: str = "",
+    width: int = 1280,
+    height: int = 720,
+    dpi: int = 96,
+):
+    """
+    Perform a complete Guacamole RDP handshake.
+
+    Returns:
+        reader, writer, connection_id,
+        pending_instructions
+
+    The caller owns reader/writer and must close writer.
+    """
+
+    reader, writer = await open_guacd()
+
+    try:
+        # -------------------------------------------------
+        # 1. SELECT RDP
+        # -------------------------------------------------
+
+        await send_instruction(
+            writer,
+            "select",
+            "rdp",
+        )
+
+        args_response = await asyncio.wait_for(
+            read_instruction(reader),
+            timeout=10,
+        )
+
+        if (
+            not args_response
+            or args_response[0] != "args"
+        ):
+            raise GuacdError(
+                "Expected args from guacd, got: "
+                f"{args_response}"
+            )
+
+        argument_names = args_response[1:]
+
+
+        # -------------------------------------------------
+        # 2. CLIENT CAPABILITIES
+        # -------------------------------------------------
+
+        await send_instruction(
+            writer,
+            "size",
+            str(width),
+            str(height),
+            str(dpi),
+        )
+
+        # Audio/video can be expanded later.
+        await send_instruction(
+            writer,
+            "audio",
+        )
+
+        await send_instruction(
+            writer,
+            "video",
+        )
+
+        await send_instruction(
+            writer,
+            "image",
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+        )
+
+        # -------------------------------------------------
+        # 3. CONNECT
+        # -------------------------------------------------
+
+        connect_values = (
+            build_rdp_connect_values(
+                argument_names,
+                hostname=hostname,
+                port=port,
+                username=username,
+                password=password,
+                domain=domain,
+                width=width,
+                height=height,
+                dpi=dpi,
+            )
+        )
+
+        await send_instruction(
+            writer,
+            "connect",
+            *connect_values,
+        )
+
+        # -------------------------------------------------
+        # 4. WAIT FOR READY
+        # -------------------------------------------------
+
+        pending_instructions = []
+
+        while True:
+            response = await asyncio.wait_for(
+                read_instruction(reader),
+                timeout=20,
+            )
+
+            if not response:
+                continue
+
+            opcode = response[0]
+
+            if opcode == "ready":
+                connection_id = (
+                    response[1]
+                    if len(response) > 1
+                    else ""
+                )
+
+                return (
+                    reader,
+                    writer,
+                    connection_id,
+                    pending_instructions,
+                )
+
+            if opcode == "error":
+                message = (
+                    response[1]
+                    if len(response) > 1
+                    else "Unknown guacd error"
+                )
+
+                status = (
+                    response[2]
+                    if len(response) > 2
+                    else ""
+                )
+
+                raise GuacdError(
+                    f"{message} "
+                    f"(status={status})"
+                )
+
+            # Preserve anything emitted before ready.
+            # These instructions belong to the client
+            # stream and must not be discarded.
+            pending_instructions.append(
+                response
+            )
+
+    except Exception:
+        writer.close()
+
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        raise

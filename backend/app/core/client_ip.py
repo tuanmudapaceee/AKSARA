@@ -1,0 +1,146 @@
+from ipaddress import ip_address
+
+from fastapi import (
+    Request,
+    WebSocket,
+)
+
+
+def _is_trusted_proxy(peer_ip: str | None) -> bool:
+    """
+    Current AKSARA Docker deployment:
+    trust forwarded headers only when the direct peer is
+    a private or loopback address.
+
+    Production deployment can later replace this with an
+    explicit TRUSTED_PROXY_NETWORKS configuration.
+    """
+
+    if not peer_ip:
+        return False
+
+    try:
+        address = ip_address(peer_ip)
+
+        return (
+            address.is_private
+            or address.is_loopback
+        )
+
+    except ValueError:
+        return False
+
+
+def get_websocket_client_ip(
+    websocket: WebSocket,
+) -> str | None:
+    """
+    Return the original client IP for an AKSARA WebSocket.
+
+    When the direct peer is a trusted reverse proxy, use
+    X-Forwarded-For / X-Real-IP.
+
+    Otherwise fall back to the direct socket peer address.
+    """
+
+    peer_ip = (
+        websocket.client.host
+        if websocket.client
+        else None
+    )
+
+    if not _is_trusted_proxy(peer_ip):
+        return peer_ip
+
+    forwarded_for = websocket.headers.get(
+        "x-forwarded-for"
+    )
+
+    if forwarded_for:
+        # X-Forwarded-For can contain:
+        #
+        # client, proxy1, proxy2
+        #
+        # The left-most value is the original client
+        # in the current AKSARA trusted-proxy topology.
+        candidate = (
+            forwarded_for
+            .split(",", 1)[0]
+            .strip()
+        )
+
+        try:
+            ip_address(candidate)
+            return candidate
+        except ValueError:
+            pass
+
+    real_ip = websocket.headers.get(
+        "x-real-ip"
+    )
+
+    if real_ip:
+        candidate = real_ip.strip()
+
+        try:
+            ip_address(candidate)
+            return candidate
+        except ValueError:
+            pass
+
+    return peer_ip
+
+
+def get_request_client_ip(
+    request: Request,
+) -> str | None:
+    """
+    Return the original client IP for an AKSARA HTTP request.
+
+    When the direct peer is a trusted reverse proxy, use
+    X-Forwarded-For / X-Real-IP.
+
+    Otherwise fall back to the direct socket peer address.
+    """
+
+    peer_ip = (
+        request.client.host
+        if request.client
+        else None
+    )
+
+    if not _is_trusted_proxy(peer_ip):
+        return peer_ip
+
+    forwarded_for = request.headers.get(
+        "x-forwarded-for"
+    )
+
+    if forwarded_for:
+        candidate = (
+            forwarded_for
+            .split(",", 1)[0]
+            .strip()
+        )
+
+        try:
+            ip_address(candidate)
+            return candidate
+        except ValueError:
+            pass
+
+    real_ip = request.headers.get(
+        "x-real-ip"
+    )
+
+    if real_ip:
+        candidate = real_ip.strip()
+
+        try:
+            ip_address(candidate)
+            return candidate
+        except ValueError:
+            pass
+
+    return peer_ip
+

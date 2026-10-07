@@ -1,0 +1,732 @@
+import asyncio
+from datetime import datetime, timezone
+
+from fastapi import (
+    APIRouter,
+    WebSocket,
+    WebSocketDisconnect,
+)
+
+from app.database import SessionLocal
+from app.models.user import User
+from app.models.server import Server
+from app.models.session import Session as RDPClientSession
+
+from app.core.config import settings
+from app.core.client_ip import get_websocket_client_ip
+from app.services.access_control import can_access_server
+from app.services.audit import create_audit_log
+from app.services.guacd import (
+    GuacdError,
+    connect_rdp,
+    encode_instruction,
+    read_instruction,
+)
+
+from jose import jwt, JWTError
+
+
+router = APIRouter(
+    tags=["RDP WebSocket"]
+)
+
+
+def authenticate_websocket(
+    token: str,
+):
+    """
+    Authenticate AKSARA WebSocket using the same
+    JWT flow currently used by SSH WebSocket.
+    """
+
+    db = SessionLocal()
+
+    try:
+        try:
+            payload = jwt.decode(
+                token,
+                settings.SECRET_KEY,
+                algorithms=[
+                    settings.JWT_ALGORITHM
+                ],
+            )
+
+            username = payload.get(
+                "sub"
+            )
+
+            if not username:
+                db.close()
+                return None, None
+
+        except JWTError:
+            db.close()
+            return None, None
+
+        user = (
+            db.query(User)
+            .filter(
+                User.username ==
+                username
+            )
+            .first()
+        )
+
+        if (
+            not user
+            or not user.is_active
+        ):
+            db.close()
+            return None, None
+
+        return user, db
+
+    except Exception:
+        db.close()
+        raise
+
+
+@router.websocket(
+    "/ws/rdp/{server_id}"
+)
+async def rdp_websocket(
+    websocket: WebSocket,
+    server_id: int,
+):
+    db = None
+    user = None
+    server = None
+
+    guacd_writer = None
+    session_record = None
+
+    source_ip = get_websocket_client_ip(
+        websocket
+    )
+
+    try:
+        # =============================================
+        # TOKEN
+        # =============================================
+
+        token = (
+            websocket.query_params.get(
+                "token"
+            )
+        )
+
+        if not token:
+            await websocket.close(
+                code=4401,
+                reason="Missing token",
+            )
+            return
+
+        # =============================================
+        # AUTHENTICATION
+        # =============================================
+
+        user, db = (
+            authenticate_websocket(
+                token
+            )
+        )
+
+        if not user or not db:
+            await websocket.close(
+                code=4401,
+                reason="Unauthorized",
+            )
+            return
+
+        # =============================================
+        # SERVER LOOKUP
+        # =============================================
+
+        server = (
+            db.query(Server)
+            .filter(
+                Server.id ==
+                server_id
+            )
+            .first()
+        )
+
+        if not server:
+            db.close()
+            db = None
+
+            await websocket.close(
+                code=4404,
+                reason="Server not found",
+            )
+            return
+
+        # =============================================
+        # SERVER ENABLED
+        # =============================================
+
+        if not server.is_active:
+            create_audit_log(
+                db=db,
+                action="RDP_ACCESS_DENIED",
+                user_id=user.id,
+                resource_type="server",
+                resource_id=server.id,
+                source_ip=source_ip,
+                detail=(
+                    "RDP access denied to "
+                    f"{server.name}: "
+                    "server disabled"
+                ),
+            )
+
+            db.commit()
+
+            await websocket.close(
+                code=4403,
+                reason="Server disabled",
+            )
+            return
+
+        # =============================================
+        # PROTOCOL CHECK
+        # =============================================
+
+        if (
+            not server.protocol
+            or server.protocol.upper()
+            != "RDP"
+        ):
+            create_audit_log(
+                db=db,
+                action="RDP_ACCESS_DENIED",
+                user_id=user.id,
+                resource_type="server",
+                resource_id=server.id,
+                source_ip=source_ip,
+                detail=(
+                    "RDP access denied to "
+                    f"{server.name}: "
+                    "server protocol is not RDP"
+                ),
+            )
+
+            db.commit()
+
+            await websocket.close(
+                code=4403,
+                reason="Server is not RDP",
+            )
+            return
+
+        # =============================================
+        # RBAC / SERVER ACCESS
+        # =============================================
+
+        if not can_access_server(
+            db,
+            user,
+            server,
+            "RDP",
+        ):
+            create_audit_log(
+                db=db,
+                action="RDP_ACCESS_DENIED",
+                user_id=user.id,
+                resource_type="server",
+                resource_id=server.id,
+                source_ip=source_ip,
+                detail=(
+                    "RDP access denied to "
+                    f"{server.name}"
+                ),
+            )
+
+            db.commit()
+
+            await websocket.close(
+                code=4403,
+                reason="Access denied",
+            )
+            return
+
+        # =============================================
+        # WEBSOCKET ACCEPT
+        # =============================================
+
+        await websocket.accept()
+
+        await websocket.send_json({
+            "type": "ready",
+            "server": server.name,
+            "server_id": server.id,
+            "protocol": "RDP",
+        })
+
+        # =============================================
+        # CREDENTIALS
+        # =============================================
+
+        credentials = (
+            await websocket.receive_json()
+        )
+
+        rdp_username = (
+            credentials.get(
+                "username",
+                ""
+            )
+            .strip()
+        )
+
+        rdp_password = (
+            credentials.get(
+                "password",
+                ""
+            )
+        )
+
+        rdp_domain = (
+            credentials.get(
+                "domain",
+                ""
+            )
+            .strip()
+        )
+
+        try:
+            width = int(
+                credentials.get(
+                    "width",
+                    1280,
+                )
+            )
+
+            height = int(
+                credentials.get(
+                    "height",
+                    720,
+                )
+            )
+
+            dpi = int(
+                credentials.get(
+                    "dpi",
+                    96,
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            width = 1280
+            height = 720
+            dpi = 96
+
+        width = max(
+            640,
+            min(width, 7680),
+        )
+
+        height = max(
+            480,
+            min(height, 4320),
+        )
+
+        dpi = max(
+            72,
+            min(dpi, 300),
+        )
+
+        if (
+            not rdp_username
+            or not rdp_password
+        ):
+            await websocket.send_json({
+                "type": "error",
+                "message":
+                    "RDP username and password "
+                    "are required",
+            })
+            return
+
+        # =============================================
+        # CONNECT TO WINDOWS THROUGH GUACD
+        # =============================================
+
+        try:
+            (
+                guacd_reader,
+                guacd_writer,
+                connection_id,
+                pending_instructions,
+            ) = await connect_rdp(
+                hostname=
+                    server.ip_address,
+                port=
+                    server.port,
+                username=
+                    rdp_username,
+                password=
+                    rdp_password,
+                domain=
+                    rdp_domain,
+                width=
+                    width,
+                height=
+                    height,
+                dpi=
+                    dpi,
+            )
+
+        except GuacdError as exc:
+            create_audit_log(
+                db=db,
+                action=
+                    "RDP_CONNECTION_FAILED",
+                user_id=user.id,
+                resource_type="server",
+                resource_id=server.id,
+                source_ip=source_ip,
+                detail=(
+                    "RDP connection failed "
+                    f"to {server.name}"
+                ),
+            )
+
+            db.commit()
+
+            print(
+                "AKSARA RDP connection "
+                f"failed: {exc}"
+            )
+
+            await websocket.send_json({
+                "type": "error",
+                "message":
+                    "Unable to establish "
+                    "RDP session",
+            })
+
+            return
+
+        # Password is no longer needed by AKSARA.
+        rdp_password = None
+
+        # =============================================
+        # CREATE AKSARA SESSION
+        # =============================================
+
+        session_record = (
+            RDPClientSession(
+                user_id=user.id,
+                server_id=server.id,
+                protocol="RDP",
+                source_ip=source_ip,
+                remote_username=
+                    rdp_username,
+                started_at=(
+                    datetime.now(
+                        timezone.utc
+                    )
+                ),
+                status="ACTIVE",
+            )
+        )
+
+        db.add(
+            session_record
+        )
+
+        db.flush()
+
+        create_audit_log(
+            db=db,
+            action=
+                "RDP_SESSION_STARTED",
+            user_id=user.id,
+            resource_type="session",
+            resource_id=
+                session_record.id,
+            source_ip=source_ip,
+            detail=(
+                "RDP session started "
+                f"to {server.name} "
+                f"as {rdp_username}"
+            ),
+        )
+
+        db.commit()
+
+        db.refresh(
+            session_record
+        )
+
+        # =============================================
+        # CONNECTION SUCCESS
+        # =============================================
+
+        await websocket.send_json({
+            "type": "connected",
+            "server": server.name,
+            "server_id": server.id,
+            "session_id":
+                session_record.id,
+            "connection_id":
+                connection_id,
+            "protocol": "RDP",
+        })
+
+        # =============================================
+        # GUACAMOLE PROTOCOL RELAY
+        #
+        # After the initial AKSARA JSON handshake,
+        # WebSocket text frames contain raw Guacamole
+        # protocol instructions.
+        # =============================================
+
+        async def guacd_to_browser():
+
+            # Flush protocol instructions which guacd
+            # emitted before the ready instruction.
+            for instruction in pending_instructions:
+                print(
+                    "AKSARA RDP GUACD->BROWSER "
+                    f"[BUFFERED] opcode={instruction[0]}",
+                    flush=True,
+                )
+
+                await websocket.send_text(
+                    encode_instruction(
+                        *instruction
+                    ).decode("utf-8")
+                )
+
+            while True:
+                instruction = (
+                    await read_instruction(
+                        guacd_reader
+                    )
+                )
+
+                if not instruction:
+                    continue
+
+                print(
+                    "AKSARA RDP GUACD->BROWSER "
+                    f"opcode={instruction[0]}",
+                    flush=True,
+                )
+
+                await websocket.send_text(
+                    encode_instruction(
+                        *instruction
+                    ).decode("utf-8")
+                )
+
+                if (
+                    instruction[0] ==
+                    "disconnect"
+                ):
+                    return
+
+        async def browser_to_guacd():
+            while True:
+                message = (
+                    await websocket.receive()
+                )
+
+                message_type = (
+                    message.get("type")
+                )
+
+                if (
+                    message_type ==
+                    "websocket.disconnect"
+                ):
+                    return
+
+                text_data = (
+                    message.get("text")
+                )
+
+                if text_data is None:
+                    continue
+
+                # Keep compatibility with the temporary
+                # JSON disconnect message used by our
+                # backend test client.
+                if text_data.startswith("{"):
+                    try:
+                        control = (
+                            __import__("json")
+                            .loads(text_data)
+                        )
+
+                        if (
+                            control.get("type")
+                            == "disconnect"
+                        ):
+                            return
+
+                        if (
+                            control.get("type")
+                            == "ping"
+                        ):
+                            await (
+                                websocket
+                                .send_json({
+                                    "type": "pong"
+                                })
+                            )
+                            continue
+
+                    except Exception:
+                        pass
+
+                guacd_writer.write(
+                    text_data.encode(
+                        "utf-8"
+                    )
+                )
+
+                await guacd_writer.drain()
+
+        guacd_task = asyncio.create_task(
+            guacd_to_browser()
+        )
+
+        browser_task = asyncio.create_task(
+            browser_to_guacd()
+        )
+
+        done, pending = await asyncio.wait(
+            {
+                guacd_task,
+                browser_task,
+            },
+            return_when=
+                asyncio.FIRST_COMPLETED,
+        )
+
+        for task in pending:
+            task.cancel()
+
+        for task in pending:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        for task in done:
+            exception = task.exception()
+
+            if exception:
+                raise exception
+
+    except WebSocketDisconnect:
+        pass
+
+    except Exception as exc:
+        print(
+            "AKSARA RDP WebSocket "
+            f"error: {exc}"
+        )
+
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message":
+                    "RDP session error",
+            })
+
+        except Exception:
+            pass
+
+    finally:
+        # =============================================
+        # CLOSE GUACD
+        # =============================================
+
+        if guacd_writer:
+            try:
+                guacd_writer.close()
+
+                await (
+                    guacd_writer
+                    .wait_closed()
+                )
+
+            except Exception:
+                pass
+
+        # =============================================
+        # CLOSE AKSARA SESSION
+        # =============================================
+
+        if (
+            session_record
+            and db
+        ):
+            try:
+                # Only a normally active session is closed here.
+                # Administrative termination may already have changed
+                # the status to TERMINATED and must not be overwritten.
+                db.refresh(session_record)
+
+                if session_record.status == "ACTIVE":
+                    session_record.status = (
+                        "CLOSED"
+                    )
+
+                    session_record.ended_at = (
+                        datetime.now(
+                            timezone.utc
+                        )
+                    )
+
+                    create_audit_log(
+                        db=db,
+                        action=
+                            "RDP_SESSION_ENDED",
+                        user_id=user.id,
+                        resource_type=
+                            "session",
+                        resource_id=
+                            session_record.id,
+                        source_ip=
+                            source_ip,
+                        detail=(
+                            "RDP session ended "
+                            f"to {server.name}"
+                        ),
+                    )
+
+                    db.commit()
+
+            except Exception as exc:
+                print(
+                    "AKSARA RDP session "
+                    f"close failed: {exc}"
+                )
+
+                db.rollback()
+
+        # =============================================
+        # CLOSE DATABASE
+        # =============================================
+
+        if db:
+            db.close()
+
+        # =============================================
+        # CLOSE WEBSOCKET
+        # =============================================
+
+        try:
+            await websocket.close()
+
+        except Exception:
+            pass

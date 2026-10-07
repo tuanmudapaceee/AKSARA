@@ -1,0 +1,1692 @@
+import hmac
+import os
+
+from datetime import timedelta
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    status,
+)
+
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.core.dependencies import require_super_admin
+
+from app.database import get_db
+
+from app.models.server import Server
+from app.models.session import Session as SSHSession
+from app.models.server_activity_event import ServerActivityEvent
+from app.models.session_command import SessionCommand
+from app.models.audit_log import AuditLog
+from app.models.user import User
+
+from app.schemas.server_activity import (
+    AgentActivityEventCreate,
+    ServerActivityResponse,
+)
+
+
+router = APIRouter(
+    prefix="/api/server-activity",
+    tags=["Server Activity"],
+)
+
+
+#
+# Maximum gap between AKSARA session creation and
+# the Linux interactive shell appearing in auditd.
+#
+SESSION_BIND_WINDOW_SECONDS = 30
+
+#
+# Allow a very small amount of audit activity immediately
+# before the DB session timestamp when backfilling.
+#
+BACKFILL_GRACE_SECONDS = 5
+
+
+def verify_agent_key(
+    x_aksara_agent_key: str | None,
+):
+    if not x_aksara_agent_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Agent authentication required",
+        )
+
+    if not hmac.compare_digest(
+        x_aksara_agent_key,
+        settings.AGENT_INGEST_KEY,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid agent key",
+        )
+
+
+def is_interactive_shell_event(
+    payload: AgentActivityEventCreate,
+) -> bool:
+    """
+    Only use an actual interactive Bash process with a TTY
+    to establish the initial Linux audit-session binding.
+
+    We intentionally do not bind from arbitrary processes
+    such as cron, nano, ls, php, systemd, etc.
+    """
+
+    if payload.event_type.upper() != "PROCESS_EXECUTED":
+        return False
+
+    if not payload.audit_session:
+        return False
+
+    if not payload.tty:
+        return False
+
+    if not payload.process:
+        return False
+
+    process_name = os.path.basename(
+        payload.process
+    ).lower()
+
+    return process_name == "bash"
+
+
+def find_session_by_audit_session(
+    db: Session,
+    *,
+    server_id: int,
+    audit_session: int,
+):
+    """
+    Once a Linux audit session has been bound to AKSARA,
+    this becomes the authoritative correlation method.
+    """
+
+    return (
+        db.query(SSHSession)
+        .filter(
+            SSHSession.server_id == server_id,
+            SSHSession.audit_session == audit_session,
+        )
+        .order_by(
+            SSHSession.started_at.desc()
+        )
+        .first()
+    )
+
+
+def find_bind_candidate(
+    db: Session,
+    *,
+    server_id: int,
+    remote_username: str | None,
+    event_time,
+):
+    """
+    Find exactly one ACTIVE AKSARA SSH session which is
+    eligible to be bound to a newly observed Linux
+    audit session.
+
+    If multiple candidates exist, do not guess.
+    """
+
+    if not remote_username:
+        return None
+
+    earliest_start = (
+        event_time
+        - timedelta(
+            seconds=SESSION_BIND_WINDOW_SECONDS
+        )
+    )
+
+    candidates = (
+        db.query(SSHSession)
+        .filter(
+            SSHSession.server_id == server_id,
+
+            SSHSession.remote_username ==
+            remote_username,
+
+            SSHSession.status == "ACTIVE",
+
+            SSHSession.protocol == "SSH",
+
+            SSHSession.audit_session.is_(None),
+
+            SSHSession.started_at <= event_time,
+
+            SSHSession.started_at >= earliest_start,
+        )
+        .order_by(
+            SSHSession.started_at.desc()
+        )
+        .limit(2)
+        .all()
+    )
+
+    #
+    # Safety rule:
+    # bind only if there is exactly one possible session.
+    #
+    if len(candidates) != 1:
+        return None
+
+    return candidates[0]
+
+
+def bind_linux_audit_session(
+    db: Session,
+    *,
+    ssh_session: SSHSession,
+    payload: AgentActivityEventCreate,
+):
+    """
+    Bind AKSARA Session to the Linux audit session.
+
+    Example:
+        AKSARA Session #27
+        ->
+        audit_session 15267
+        tty pts1
+        shell pid 1432445
+    """
+
+    ssh_session.audit_session = (
+        payload.audit_session
+    )
+
+    ssh_session.tty = (
+        payload.tty
+    )
+
+    ssh_session.remote_shell_pid = (
+        payload.pid
+    )
+
+    db.flush()
+
+
+def backfill_session_events(
+    db: Session,
+    *,
+    ssh_session: SSHSession,
+):
+    """
+    Some audit events can arrive before the Bash event which
+    establishes the binding.
+
+    Once the mapping is known, attach earlier events from the
+    same Linux audit session to the AKSARA Session.
+
+    We only backfill events which:
+      - belong to the same server
+      - have the same Linux audit_session
+      - have no session_id yet
+      - are within the AKSARA session time window
+    """
+
+    if ssh_session.audit_session is None:
+        return
+
+    earliest_time = (
+        ssh_session.started_at
+        - timedelta(
+            seconds=BACKFILL_GRACE_SECONDS
+        )
+    )
+
+    (
+        db.query(ServerActivityEvent)
+        .filter(
+            ServerActivityEvent.server_id ==
+            ssh_session.server_id,
+
+            ServerActivityEvent.audit_session ==
+            ssh_session.audit_session,
+
+            ServerActivityEvent.session_id.is_(None),
+
+            ServerActivityEvent.event_time >=
+            earliest_time,
+        )
+        .update(
+            {
+                ServerActivityEvent.session_id:
+                    ssh_session.id
+            },
+            synchronize_session=False,
+        )
+    )
+
+
+def find_legacy_matching_session(
+    db: Session,
+    *,
+    server_id: int,
+    remote_username: str | None,
+    event_time,
+):
+    """
+    Legacy fallback.
+
+    This is used ONLY when an event does not contain a Linux
+    audit_session at all.
+
+    Events which do contain audit_session must not fall back
+    to username/time matching, because that could associate
+    cron or another SSH login with the wrong AKSARA session.
+    """
+
+    if not remote_username:
+        return None
+
+    session = (
+        db.query(SSHSession)
+        .filter(
+            SSHSession.server_id == server_id,
+
+            SSHSession.remote_username ==
+            remote_username,
+
+            SSHSession.status == "ACTIVE",
+
+            SSHSession.started_at <= event_time,
+        )
+        .order_by(
+            SSHSession.started_at.desc()
+        )
+        .first()
+    )
+
+    if session:
+        return session
+
+    grace_time = (
+        event_time
+        - timedelta(minutes=2)
+    )
+
+    return (
+        db.query(SSHSession)
+        .filter(
+            SSHSession.server_id == server_id,
+
+            SSHSession.remote_username ==
+            remote_username,
+
+            SSHSession.started_at <= event_time,
+
+            SSHSession.ended_at.isnot(None),
+
+            SSHSession.ended_at >= grace_time,
+        )
+        .order_by(
+            SSHSession.started_at.desc()
+        )
+        .first()
+    )
+
+
+def correlate_session(
+    db: Session,
+    *,
+    payload: AgentActivityEventCreate,
+):
+    """
+    Correlation priority:
+
+    1. Existing server_id + audit_session mapping
+    2. Bind new interactive Bash/TTY session
+    3. Legacy fallback ONLY when audit_session is absent
+    4. Otherwise leave event uncorrelated
+    """
+
+    #
+    # --------------------------------------------------------
+    # 1. Strong correlation: Linux audit_session already bound
+    # --------------------------------------------------------
+    #
+    if payload.audit_session is not None:
+
+        matched_session = (
+            find_session_by_audit_session(
+                db,
+
+                server_id=
+                    payload.server_id,
+
+                audit_session=
+                    payload.audit_session,
+            )
+        )
+
+        if matched_session:
+            return matched_session
+
+
+        #
+        # ----------------------------------------------------
+        # 2. First interactive Bash event:
+        #    establish Linux -> AKSARA mapping
+        # ----------------------------------------------------
+        #
+        if is_interactive_shell_event(
+            payload
+        ):
+            candidate = (
+                find_bind_candidate(
+                    db,
+
+                    server_id=
+                        payload.server_id,
+
+                    remote_username=
+                        payload.remote_username,
+
+                    event_time=
+                        payload.event_time,
+                )
+            )
+
+            if candidate:
+                bind_linux_audit_session(
+                    db,
+
+                    ssh_session=
+                        candidate,
+
+                    payload=
+                        payload,
+                )
+
+                backfill_session_events(
+                    db,
+
+                    ssh_session=
+                        candidate,
+                )
+
+                return candidate
+
+
+        #
+        # Event has a Linux audit session but it has not
+        # been safely mapped to an AKSARA Session.
+        #
+        # DO NOT guess by username/time.
+        #
+        return None
+
+
+    #
+    # --------------------------------------------------------
+    # 3. Old agents/events without audit_session
+    # --------------------------------------------------------
+    #
+    return find_legacy_matching_session(
+        db,
+
+        server_id=
+            payload.server_id,
+
+        remote_username=
+            payload.remote_username,
+
+        event_time=
+            payload.event_time,
+    )
+
+
+@router.post(
+    "/ingest",
+)
+def ingest_server_activity(
+    payload: AgentActivityEventCreate,
+
+    x_aksara_agent_key: str | None = Header(
+        default=None
+    ),
+
+    db: Session = Depends(
+        get_db
+    ),
+):
+    verify_agent_key(
+        x_aksara_agent_key
+    )
+
+    server = (
+        db.query(Server)
+        .filter(
+            Server.id ==
+            payload.server_id
+        )
+        .first()
+    )
+
+    if not server:
+        raise HTTPException(
+            status_code=404,
+            detail="Server not found",
+        )
+
+    matched_session = correlate_session(
+        db,
+        payload=payload,
+    )
+
+    event = ServerActivityEvent(
+        session_id=(
+            matched_session.id
+            if matched_session
+            else None
+        ),
+
+        server_id=
+            payload.server_id,
+
+        remote_username=
+            payload.remote_username,
+
+        event_type=
+            payload.event_type.upper(),
+
+        path=
+            payload.path,
+
+        process=
+            payload.process,
+
+        command=
+            payload.command,
+
+        syscall=
+            payload.syscall,
+
+        pid=
+            payload.pid,
+
+        ppid=
+            payload.ppid,
+
+        auid=
+            payload.auid,
+
+        audit_session=
+            payload.audit_session,
+
+        tty=
+            payload.tty,
+
+        success=
+            payload.success,
+
+        raw_detail=
+            payload.raw_detail,
+
+        event_time=
+            payload.event_time,
+    )
+
+    db.add(event)
+
+    db.commit()
+
+    db.refresh(event)
+
+    return {
+        "status":
+            "accepted",
+
+        "event_id":
+            event.id,
+
+        "session_id":
+            event.session_id,
+
+        "audit_session":
+            event.audit_session,
+
+        "tty":
+            event.tty,
+    }
+
+
+@router.get(
+    "/session/{session_id}",
+    response_model=
+        list[ServerActivityResponse],
+)
+def get_session_activity(
+    session_id: int,
+
+    db: Session =
+        Depends(get_db),
+
+    current_user =
+        Depends(require_super_admin),
+):
+    return (
+        db.query(
+            ServerActivityEvent
+        )
+        .filter(
+            ServerActivityEvent.session_id ==
+            session_id
+        )
+        .order_by(
+            ServerActivityEvent.event_time.asc()
+        )
+        .all()
+    )
+
+# ============================================================
+# UNIFIED SESSION ACTIVITY TIMELINE
+# ============================================================
+
+def classify_activity_event(
+    event_type: str,
+) -> str:
+    """
+    Normalize low-level event types into UI categories.
+    """
+
+    event_type = (
+        event_type or ""
+    ).upper()
+
+    if event_type.startswith(
+        "FILE_"
+    ):
+        return "FILE"
+
+    if (
+        event_type.startswith(
+            "USER_"
+        )
+        or event_type.startswith(
+            "GROUP_"
+        )
+        or event_type ==
+            "PASSWORD_CHANGED"
+    ):
+        return "IDENTITY"
+
+    if event_type.startswith(
+        "PACKAGE_"
+    ):
+        return "PACKAGE"
+
+    if event_type.startswith(
+        "SERVICE_"
+    ):
+        return "SERVICE"
+
+    if event_type.startswith(
+        "CONTAINER_"
+    ):
+        return "CONTAINER"
+
+    if event_type.startswith(
+        "PROCESS_"
+    ):
+        return "PROCESS"
+
+    if (
+        event_type.startswith(
+            "NETWORK_"
+        )
+        or event_type.startswith(
+            "FIREWALL_"
+        )
+    ):
+        return "NETWORK"
+
+    if event_type.startswith(
+        "SECURITY_"
+    ):
+        return "SECURITY"
+
+    return "SYSTEM"
+
+
+def activity_target(
+    event: ServerActivityEvent,
+):
+    """
+    Select the most useful human-readable target
+    for the timeline UI.
+    """
+
+    if event.path:
+        return event.path
+
+    if event.command:
+        return event.command
+
+    if event.process:
+        return event.process
+
+    return None
+
+
+# Legacy duplicate timeline endpoint.
+# HTTP registration disabled because the unified
+# timeline endpoint below is the canonical route.
+def get_unified_session_timeline(
+    session_id: int,
+
+    db: Session =
+        Depends(get_db),
+
+    current_user=
+        Depends(
+            require_super_admin
+        ),
+):
+    """
+    Return a single chronological activity timeline
+    for one AKSARA remote session.
+
+    Sources:
+      - Session start/end
+      - SessionCommand
+      - ServerActivityEvent
+    """
+
+    ssh_session = (
+        db.query(
+            SSHSession
+        )
+        .filter(
+            SSHSession.id ==
+            session_id
+        )
+        .first()
+    )
+
+    if not ssh_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+
+    commands = (
+        db.query(
+            SessionCommand
+        )
+        .filter(
+            SessionCommand.session_id ==
+            session_id
+        )
+        .order_by(
+            SessionCommand.executed_at.asc()
+        )
+        .all()
+    )
+
+
+    activity_events = (
+        db.query(
+            ServerActivityEvent
+        )
+        .filter(
+            ServerActivityEvent.session_id ==
+            session_id
+        )
+        .order_by(
+            ServerActivityEvent.event_time.asc()
+        )
+        .all()
+    )
+
+
+    timeline = []
+
+
+    #
+    # --------------------------------------------------------
+    # SESSION START
+    # --------------------------------------------------------
+    #
+
+    if ssh_session.started_at:
+
+        timeline.append(
+            {
+                "source":
+                    "session",
+
+                "source_id":
+                    ssh_session.id,
+
+                "type":
+                    "SESSION_STARTED",
+
+                "category":
+                    "SESSION",
+
+                "time":
+                    ssh_session.started_at,
+
+                "remote_username":
+                    ssh_session.remote_username,
+
+                "command":
+                    None,
+
+                "target":
+                    None,
+
+                "path":
+                    None,
+
+                "process":
+                    None,
+
+                "syscall":
+                    None,
+
+                "success":
+                    True,
+
+                "audit_session":
+                    ssh_session.audit_session,
+
+                "tty":
+                    ssh_session.tty,
+
+                "pid":
+                    ssh_session.remote_shell_pid,
+
+                "detail":
+                    (
+                        f"{ssh_session.remote_username or 'User'} "
+                        f"connected using "
+                        f"{ssh_session.protocol}"
+                    ),
+
+                "raw_detail":
+                    None,
+
+                "_sort_time":
+                    ssh_session.started_at,
+            }
+        )
+
+
+    #
+    # --------------------------------------------------------
+    # COMMANDS
+    # --------------------------------------------------------
+    #
+
+    for command in commands:
+
+        timeline.append(
+            {
+                "source":
+                    "command",
+
+                "source_id":
+                    command.id,
+
+                "type":
+                    "COMMAND_EXECUTED",
+
+                "category":
+                    "COMMAND",
+
+                "time":
+                    command.executed_at,
+
+                "remote_username":
+                    command.remote_username,
+
+                "command":
+                    command.command,
+
+                "target":
+                    None,
+
+                "path":
+                    None,
+
+                "process":
+                    None,
+
+                "syscall":
+                    None,
+
+                "success":
+                    True,
+
+                "audit_session":
+                    ssh_session.audit_session,
+
+                "tty":
+                    ssh_session.tty,
+
+                "pid":
+                    None,
+
+                "detail":
+                    command.command,
+
+                "raw_detail":
+                    None,
+
+                "_sort_time":
+                    command.executed_at,
+            }
+        )
+
+
+    #
+    # --------------------------------------------------------
+    # AUDIT / AGENT EVENTS
+    # --------------------------------------------------------
+    #
+
+    for event in activity_events:
+
+        category = (
+            classify_activity_event(
+                event.event_type
+            )
+        )
+
+        timeline.append(
+            {
+                "source":
+                    "audit",
+
+                "source_id":
+                    event.id,
+
+                "type":
+                    event.event_type,
+
+                "category":
+                    category,
+
+                "time":
+                    event.event_time,
+
+                "remote_username":
+                    event.remote_username,
+
+                "command":
+                    event.command,
+
+                "target":
+                    activity_target(
+                        event
+                    ),
+
+                "path":
+                    event.path,
+
+                "process":
+                    event.process,
+
+                "syscall":
+                    event.syscall,
+
+                "success":
+                    event.success,
+
+                "audit_session":
+                    event.audit_session,
+
+                "tty":
+                    event.tty,
+
+                "pid":
+                    event.pid,
+
+                "ppid":
+                    event.ppid,
+
+                "auid":
+                    event.auid,
+
+                "detail":
+                    (
+                        event.path
+                        or event.command
+                        or event.process
+                        or event.event_type
+                    ),
+
+                "raw_detail":
+                    event.raw_detail,
+
+                "_sort_time":
+                    event.event_time,
+            }
+        )
+
+
+    #
+    # --------------------------------------------------------
+    # SESSION END
+    # --------------------------------------------------------
+    #
+
+    if ssh_session.ended_at:
+
+        timeline.append(
+            {
+                "source":
+                    "session",
+
+                "source_id":
+                    ssh_session.id,
+
+                "type":
+                    "SESSION_ENDED",
+
+                "category":
+                    "SESSION",
+
+                "time":
+                    ssh_session.ended_at,
+
+                "remote_username":
+                    ssh_session.remote_username,
+
+                "command":
+                    None,
+
+                "target":
+                    None,
+
+                "path":
+                    None,
+
+                "process":
+                    None,
+
+                "syscall":
+                    None,
+
+                "success":
+                    True,
+
+                "audit_session":
+                    ssh_session.audit_session,
+
+                "tty":
+                    ssh_session.tty,
+
+                "pid":
+                    ssh_session.remote_shell_pid,
+
+                "detail":
+                    "Remote session ended",
+
+                "raw_detail":
+                    None,
+
+                "_sort_time":
+                    ssh_session.ended_at,
+            }
+        )
+
+
+    #
+    # --------------------------------------------------------
+    # SORT
+    # --------------------------------------------------------
+    #
+
+    timeline.sort(
+        key=lambda item:
+            item["_sort_time"]
+    )
+
+
+    for item in timeline:
+        item.pop(
+            "_sort_time",
+            None,
+        )
+
+
+    #
+    # --------------------------------------------------------
+    # COUNTS
+    # --------------------------------------------------------
+    #
+
+    category_counts = {}
+
+    for item in timeline:
+
+        category = (
+            item["category"]
+        )
+
+        category_counts[
+            category
+        ] = (
+            category_counts.get(
+                category,
+                0
+            )
+            + 1
+        )
+
+
+    server_name = None
+
+    if ssh_session.server:
+        server_name = (
+            ssh_session.server.name
+        )
+
+
+    user_name = None
+
+    if ssh_session.user:
+        user_name = (
+            ssh_session.user.username
+        )
+
+
+    return {
+        "session": {
+            "id":
+                ssh_session.id,
+
+            "user_id":
+                ssh_session.user_id,
+
+            "username":
+                user_name,
+
+            "server_id":
+                ssh_session.server_id,
+
+            "server_name":
+                server_name,
+
+            "server_ip":
+                (
+                    ssh_session.server.ip_address
+                    if ssh_session.server
+                    else None
+                ),
+
+            "protocol":
+                ssh_session.protocol,
+
+            "source_ip":
+                ssh_session.source_ip,
+
+            "remote_username":
+                ssh_session.remote_username,
+
+            "status":
+                ssh_session.status,
+
+            "started_at":
+                ssh_session.started_at,
+
+            "ended_at":
+                ssh_session.ended_at,
+
+            "audit_session":
+                ssh_session.audit_session,
+
+            "tty":
+                ssh_session.tty,
+
+            "remote_shell_pid":
+                ssh_session.remote_shell_pid,
+        },
+
+        "summary": {
+            "total_events":
+                len(timeline),
+
+            "commands":
+                category_counts.get(
+                    "COMMAND",
+                    0
+                ),
+
+            "files":
+                category_counts.get(
+                    "FILE",
+                    0
+                ),
+
+            "identity":
+                category_counts.get(
+                    "IDENTITY",
+                    0
+                ),
+
+            "packages":
+                category_counts.get(
+                    "PACKAGE",
+                    0
+                ),
+
+            "services":
+                category_counts.get(
+                    "SERVICE",
+                    0
+                ),
+
+            "containers":
+                category_counts.get(
+                    "CONTAINER",
+                    0
+                ),
+
+            "processes":
+                category_counts.get(
+                    "PROCESS",
+                    0
+                ),
+
+            "network":
+                category_counts.get(
+                    "NETWORK",
+                    0
+                ),
+        },
+
+        "events":
+            timeline,
+    }
+
+
+# ============================================================
+# UNIFIED SESSION ACTIVITY TIMELINE
+# ============================================================
+
+def classify_activity_event(
+    event_type: str,
+) -> str:
+    event_type = (
+        event_type or ""
+    ).upper()
+
+    if event_type.startswith("FILE_"):
+        return "FILE"
+
+    if (
+        event_type.startswith("USER_")
+        or event_type.startswith("GROUP_")
+        or event_type == "PASSWORD_CHANGED"
+    ):
+        return "IDENTITY"
+
+    if event_type.startswith("PACKAGE_"):
+        return "PACKAGE"
+
+    if event_type.startswith("SERVICE_"):
+        return "SERVICE"
+
+    if event_type.startswith("CONTAINER_"):
+        return "CONTAINER"
+
+    if event_type.startswith("PROCESS_"):
+        return "PROCESS"
+
+    if (
+        event_type.startswith("NETWORK_")
+        or event_type.startswith("FIREWALL_")
+    ):
+        return "NETWORK"
+
+    if event_type.startswith("SECURITY_"):
+        return "SECURITY"
+
+    return "SYSTEM"
+
+
+def activity_target(
+    event: ServerActivityEvent,
+):
+    if event.path:
+        return event.path
+
+    if event.command:
+        return event.command
+
+    if event.process:
+        return event.process
+
+    return None
+
+
+@router.get(
+    "/session/{session_id}/timeline",
+)
+def get_unified_session_timeline(
+    session_id: int,
+
+    db: Session = Depends(get_db),
+
+    current_user=Depends(
+        require_super_admin
+    ),
+):
+    ssh_session = (
+        db.query(SSHSession)
+        .filter(
+            SSHSession.id == session_id
+        )
+        .first()
+    )
+
+    if not ssh_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found",
+        )
+
+    commands = (
+        db.query(SessionCommand)
+        .filter(
+            SessionCommand.session_id ==
+            session_id
+        )
+        .order_by(
+            SessionCommand.executed_at.asc()
+        )
+        .all()
+    )
+
+    activity_events = (
+        db.query(ServerActivityEvent)
+        .filter(
+            ServerActivityEvent.session_id ==
+            session_id
+        )
+        .order_by(
+            ServerActivityEvent.event_time.asc()
+        )
+        .all()
+    )
+
+    timeline = []
+
+    if ssh_session.started_at:
+        timeline.append(
+            {
+                "source": "session",
+                "source_id": ssh_session.id,
+                "type": "SESSION_STARTED",
+                "category": "SESSION",
+                "time": ssh_session.started_at,
+                "remote_username":
+                    ssh_session.remote_username,
+                "command": None,
+                "target": None,
+                "path": None,
+                "process": None,
+                "syscall": None,
+                "success": True,
+                "audit_session":
+                    ssh_session.audit_session,
+                "tty": ssh_session.tty,
+                "pid":
+                    ssh_session.remote_shell_pid,
+                "detail":
+                    (
+                        f"{ssh_session.remote_username or 'User'} "
+                        f"connected using "
+                        f"{ssh_session.protocol}"
+                    ),
+                "raw_detail": None,
+                "_sort_time":
+                    ssh_session.started_at,
+            }
+        )
+
+    for command in commands:
+        timeline.append(
+            {
+                "source": "command",
+                "source_id": command.id,
+                "type": "COMMAND_EXECUTED",
+                "category": "COMMAND",
+                "time": command.executed_at,
+                "remote_username":
+                    command.remote_username,
+                "command":
+                    command.command,
+                "target": None,
+                "path": None,
+                "process": None,
+                "syscall": None,
+                "success": True,
+                "audit_session":
+                    ssh_session.audit_session,
+                "tty":
+                    ssh_session.tty,
+                "pid": None,
+                "detail":
+                    command.command,
+                "raw_detail": None,
+                "_sort_time":
+                    command.executed_at,
+            }
+        )
+
+    for event in activity_events:
+        timeline.append(
+            {
+                "source": "audit",
+                "source_id": event.id,
+                "type":
+                    event.event_type,
+                "category":
+                    classify_activity_event(
+                        event.event_type
+                    ),
+                "time":
+                    event.event_time,
+                "remote_username":
+                    event.remote_username,
+                "command":
+                    event.command,
+                "target":
+                    activity_target(event),
+                "path":
+                    event.path,
+                "process":
+                    event.process,
+                "syscall":
+                    event.syscall,
+                "success":
+                    event.success,
+                "audit_session":
+                    event.audit_session,
+                "tty":
+                    event.tty,
+                "pid":
+                    event.pid,
+                "ppid":
+                    event.ppid,
+                "auid":
+                    event.auid,
+                "detail":
+                    (
+                        event.path
+                        or event.command
+                        or event.process
+                        or event.event_type
+                    ),
+                "raw_detail":
+                    event.raw_detail,
+                "_sort_time":
+                    event.event_time,
+            }
+        )
+
+    if ssh_session.ended_at:
+        timeline.append(
+            {
+                "source": "session",
+                "source_id":
+                    ssh_session.id,
+                "type":
+                    "SESSION_ENDED",
+                "category":
+                    "SESSION",
+                "time":
+                    ssh_session.ended_at,
+                "remote_username":
+                    ssh_session.remote_username,
+                "command": None,
+                "target": None,
+                "path": None,
+                "process": None,
+                "syscall": None,
+                "success": True,
+                "audit_session":
+                    ssh_session.audit_session,
+                "tty":
+                    ssh_session.tty,
+                "pid":
+                    ssh_session.remote_shell_pid,
+                "detail":
+                    "Remote session ended",
+                "raw_detail": None,
+                "_sort_time":
+                    ssh_session.ended_at,
+            }
+        )
+
+    timeline.sort(
+        key=lambda item:
+            item["_sort_time"]
+    )
+
+    for item in timeline:
+        item.pop(
+            "_sort_time",
+            None,
+        )
+
+    category_counts = {}
+
+    for item in timeline:
+        category = item["category"]
+
+        category_counts[
+            category
+        ] = (
+            category_counts.get(
+                category,
+                0
+            )
+            + 1
+        )
+
+    server_name = (
+        ssh_session.server.name
+        if ssh_session.server
+        else None
+    )
+
+    username = (
+        ssh_session.user.username
+        if ssh_session.user
+        else None
+    )
+
+
+    # --------------------------------------------------------
+    # ADMINISTRATIVE TERMINATION METADATA
+    # --------------------------------------------------------
+
+    termination = None
+
+    if (
+        ssh_session.status
+        and
+        ssh_session.status.upper()
+        == "TERMINATED"
+    ):
+        termination_log = (
+            db.query(AuditLog)
+            .filter(
+                AuditLog.resource_type ==
+                "session",
+                AuditLog.resource_id ==
+                ssh_session.id,
+                AuditLog.action ==
+                "RDP_SESSION_TERMINATED",
+            )
+            .order_by(
+                AuditLog.created_at.desc()
+            )
+            .first()
+        )
+
+        if termination_log:
+
+            terminated_by = None
+
+            if termination_log.user_id:
+                actor = (
+                    db.query(User)
+                    .filter(
+                        User.id ==
+                        termination_log.user_id
+                    )
+                    .first()
+                )
+
+                if actor:
+                    terminated_by = (
+                        actor.username
+                    )
+
+            reason = None
+
+            detail = (
+                termination_log.detail
+                or ""
+            )
+
+            if "reason=" in detail:
+                reason = (
+                    detail
+                    .split(
+                        "reason=",
+                        1
+                    )[1]
+                    .strip()
+                )
+
+            termination = {
+                "terminated_by":
+                    terminated_by,
+
+                "terminated_by_user_id":
+                    termination_log.user_id,
+
+                "reason":
+                    reason,
+
+                "terminated_at":
+                    termination_log.created_at,
+            }
+
+
+    return {
+        "session": {
+            "id":
+                ssh_session.id,
+            "user_id":
+                ssh_session.user_id,
+            "username":
+                username,
+            "server_id":
+                ssh_session.server_id,
+            "server_name":
+                server_name,
+            "server_ip":
+                (
+                    ssh_session.server.ip_address
+                    if ssh_session.server
+                    else None
+                ),
+            "protocol":
+                ssh_session.protocol,
+            "source_ip":
+                ssh_session.source_ip,
+            "remote_username":
+                ssh_session.remote_username,
+            "status":
+                ssh_session.status,
+            "started_at":
+                ssh_session.started_at,
+            "ended_at":
+                ssh_session.ended_at,
+            "audit_session":
+                ssh_session.audit_session,
+            "tty":
+                ssh_session.tty,
+            "remote_shell_pid":
+                ssh_session.remote_shell_pid,
+
+            "termination":
+                termination,
+        },
+
+        "summary": {
+            "total_events":
+                len(timeline),
+
+            "commands":
+                category_counts.get(
+                    "COMMAND",
+                    0
+                ),
+
+            "files":
+                category_counts.get(
+                    "FILE",
+                    0
+                ),
+
+            "identity":
+                category_counts.get(
+                    "IDENTITY",
+                    0
+                ),
+
+            "packages":
+                category_counts.get(
+                    "PACKAGE",
+                    0
+                ),
+
+            "services":
+                category_counts.get(
+                    "SERVICE",
+                    0
+                ),
+
+            "containers":
+                category_counts.get(
+                    "CONTAINER",
+                    0
+                ),
+
+            "processes":
+                category_counts.get(
+                    "PROCESS",
+                    0
+                ),
+
+            "network":
+                category_counts.get(
+                    "NETWORK",
+                    0
+                ),
+        },
+
+        "events":
+            timeline,
+    }

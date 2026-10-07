@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="35 68 116 108"
+     preserveAspectRatio="xMidYMid meet">
+  <title>AKSARA Logo</title>
+
+  <!-- Main mark: same geometry as the selected No. 05 reference -->
+  <path d="
+    M 98 75
+    L 116 102
+    L 75 170
+    L 40 170
+    Z"
+    fill="#454A50"/>
+
+  <!-- Tosca accent -->
+  <path d="
+    M 97 139
+    L 128 139
+    L 146 170
+    L 115 170
+    Z"
+    fill="#20B7AE"/>
+</svg>
